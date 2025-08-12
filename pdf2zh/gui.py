@@ -140,9 +140,11 @@ def verify_recaptcha(response):
     """
     This function verifies the reCAPTCHA response.
     """
+    from pdf2zh.translator import create_session_with_proxy
     recaptcha_url = "https://www.google.com/recaptcha/api/siteverify"
     data = {"secret": server_key, "response": response}
-    result = requests.post(recaptcha_url, data=data).json()
+    session = create_session_with_proxy()
+    result = session.post(recaptcha_url, data=data).json()
     return result.get("success")
 
 
@@ -158,9 +160,11 @@ def download_with_limit(url: str, save_path: str, size_limit: int) -> str:
     Returns:
         - The path of the downloaded file
     """
+    from pdf2zh.translator import create_session_with_proxy
     chunk_size = 1024
     total_size = 0
-    with requests.get(url, stream=True, timeout=10) as response:
+    session = create_session_with_proxy()
+    with session.get(url, stream=True, timeout=10) as response:
         response.raise_for_status()
         content = response.headers.get("Content-Disposition")
         try:  # filename from header

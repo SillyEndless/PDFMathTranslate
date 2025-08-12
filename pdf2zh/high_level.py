@@ -338,7 +338,9 @@ def translate(
         ):
             print("Online files detected, downloading...")
             try:
-                r = requests.get(file, allow_redirects=True)
+                from pdf2zh.translator import create_session_with_proxy
+                session = create_session_with_proxy()
+                r = session.get(file, allow_redirects=True)
                 if r.status_code == 200:
                     with tempfile.NamedTemporaryFile(
                         suffix=".pdf", delete=False

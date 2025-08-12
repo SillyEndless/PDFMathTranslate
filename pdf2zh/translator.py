@@ -7,6 +7,28 @@ import unicodedata
 from copy import copy
 from string import Template
 from typing import cast
+
+# Handle proxy issues before importing network-dependent modules
+def handle_proxy_environment():
+    """
+    Handle proxy environment variables to prevent httpx errors.
+    Clear problematic SOCKS proxy settings that httpx cannot handle.
+    """
+    problematic_vars = [
+        'SOCKS_PROXY', 'socks_proxy', 'ALL_PROXY', 'all_proxy'
+    ]
+    
+    for var in problematic_vars:
+        if var in os.environ:
+            proxy_value = os.environ[var]
+            if proxy_value and proxy_value.startswith('socks://'):
+                # Remove problematic SOCKS proxy
+                del os.environ[var]
+                logging.getLogger(__name__).info(f"Removed problematic proxy: {var}={proxy_value}")
+
+# Apply proxy handling before any network imports
+handle_proxy_environment()
+
 import deepl
 import ollama
 import openai
@@ -31,6 +53,65 @@ from tenacity import wait_exponential
 
 
 logger = logging.getLogger(__name__)
+
+
+def get_proxy_config():
+    """
+    Get proxy configuration from environment variables.
+    Returns a dictionary with proxy settings for requests.
+    """
+    proxies = {}
+    
+    # Check for HTTP proxy
+    if os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy'):
+        http_proxy = os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
+        if http_proxy and not http_proxy.startswith('socks://'):
+            proxies['http'] = http_proxy
+            proxies['https'] = http_proxy
+    
+    # Check for HTTPS proxy
+    if os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy'):
+        https_proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
+        if https_proxy and not https_proxy.startswith('socks://'):
+            proxies['https'] = https_proxy
+    
+    # Check for SOCKS proxy - convert to HTTP proxy if possible
+    if os.environ.get('SOCKS_PROXY') or os.environ.get('socks_proxy'):
+        socks_proxy = os.environ.get('SOCKS_PROXY') or os.environ.get('socks_proxy')
+        if socks_proxy and socks_proxy.startswith('socks://'):
+            # Convert socks:// to http:// for better compatibility
+            http_proxy = socks_proxy.replace('socks://', 'http://')
+            proxies['http'] = http_proxy
+            proxies['https'] = http_proxy
+    
+    # Check for ALL_PROXY
+    if os.environ.get('ALL_PROXY') or os.environ.get('all_proxy'):
+        all_proxy = os.environ.get('ALL_PROXY') or os.environ.get('all_proxy')
+        if all_proxy:
+            if all_proxy.startswith('socks://'):
+                # Convert socks:// to http:// for better compatibility
+                http_proxy = all_proxy.replace('socks://', 'http://')
+                proxies['http'] = http_proxy
+                proxies['https'] = http_proxy
+            else:
+                proxies['http'] = all_proxy
+                proxies['https'] = all_proxy
+    
+    return proxies
+
+
+def create_session_with_proxy():
+    """
+    Create a requests session with proxy support.
+    """
+    session = requests.Session()
+    proxies = get_proxy_config()
+    
+    if proxies:
+        session.proxies.update(proxies)
+        logger.info(f"Using proxy configuration: {proxies}")
+    
+    return session
 
 
 def remove_control_characters(s):
@@ -170,7 +251,7 @@ class GoogleTranslator(BaseTranslator):
 
     def __init__(self, lang_in, lang_out, model, ignore_cache=False, **kwargs):
         super().__init__(lang_in, lang_out, model, ignore_cache)
-        self.session = requests.Session()
+        self.session = create_session_with_proxy()
         self.endpoint = "https://translate.google.com/m"
         self.headers = {
             "User-Agent": "Mozilla/4.0 (compatible;MSIE 6.0;Windows NT 5.1;SV1;.NET CLR 1.1.4322;.NET CLR 2.0.50727;.NET CLR 3.0.04506.30)"  # noqa: E501
@@ -201,7 +282,7 @@ class BingTranslator(BaseTranslator):
 
     def __init__(self, lang_in, lang_out, model, ignore_cache=False, **kwargs):
         super().__init__(lang_in, lang_out, model, ignore_cache)
-        self.session = requests.Session()
+        self.session = create_session_with_proxy()
         self.endpoint = "https://www.bing.com/translator"
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",  # noqa: E501
@@ -274,7 +355,7 @@ class DeepLXTranslator(BaseTranslator):
         self.set_envs(envs)
         super().__init__(lang_in, lang_out, model, ignore_cache)
         self.endpoint = self.envs["DEEPLX_ENDPOINT"]
-        self.session = requests.Session()
+        self.session = create_session_with_proxy()
         auth_key = self.envs["DEEPLX_ACCESS_TOKEN"]
         if auth_key:
             self.endpoint = f"{self.endpoint}?token={auth_key}"
@@ -422,9 +503,23 @@ class OpenAITranslator(BaseTranslator):
             model = self.envs["OPENAI_MODEL"]
         super().__init__(lang_in, lang_out, model, ignore_cache)
         self.options = {"temperature": 0}  # 随机采样可能会打断公式标记
+        
+        # Configure proxy for OpenAI client
+        proxies = get_proxy_config()
+        http_client = None
+        if proxies:
+            import httpx
+            # httpx.Client uses 'proxy' parameter, not 'proxies'
+            if 'http' in proxies:
+                http_client = httpx.Client(proxy=proxies['http'])
+            elif 'https' in proxies:
+                http_client = httpx.Client(proxy=proxies['https'])
+            logger.info(f"Using proxy configuration for OpenAI: {proxies}")
+        
         self.client = openai.OpenAI(
             base_url=base_url or self.envs["OPENAI_BASE_URL"],
             api_key=api_key or self.envs["OPENAI_API_KEY"],
+            http_client=http_client,
         )
         self.prompttext = prompt
         self.add_cache_impact_parameters("temperature", self.options["temperature"])
@@ -495,11 +590,25 @@ class AzureOpenAITranslator(BaseTranslator):
             api_key = self.envs["AZURE_OPENAI_API_KEY"]
         super().__init__(lang_in, lang_out, model, ignore_cache)
         self.options = {"temperature": 0}
+        
+        # Configure proxy for Azure OpenAI client
+        proxies = get_proxy_config()
+        http_client = None
+        if proxies:
+            import httpx
+            # httpx.Client uses 'proxy' parameter, not 'proxies'
+            if 'http' in proxies:
+                http_client = httpx.Client(proxy=proxies['http'])
+            elif 'https' in proxies:
+                http_client = httpx.Client(proxy=proxies['https'])
+            logger.info(f"Using proxy configuration for Azure OpenAI: {proxies}")
+        
         self.client = openai.AzureOpenAI(
             azure_endpoint=base_url,
             azure_deployment=model,
             api_version=api_version,
             api_key=api_key,
+            http_client=http_client,
         )
         self.prompttext = prompt
         self.add_cache_impact_parameters("temperature", self.options["temperature"])
@@ -750,7 +859,8 @@ class AnythingLLMTranslator(BaseTranslator):
             "sessionId": "translation_expert",
         }
 
-        response = requests.post(
+        session = create_session_with_proxy()
+        response = session.post(
             self.api_url, headers=self.headers, data=json.dumps(payload)
         )
         response.raise_for_status()
@@ -792,7 +902,8 @@ class DifyTranslator(BaseTranslator):
         }
 
         # 向 Dify 服务器发送请求
-        response = requests.post(
+        session = create_session_with_proxy()
+        response = session.post(
             self.api_url, headers=headers, data=json.dumps(payload)
         )
         response.raise_for_status()

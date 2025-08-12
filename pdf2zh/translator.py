@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 import unicodedata
 from copy import copy
 from string import Template
@@ -179,7 +180,8 @@ class BaseTranslator:
             if cache is not None:
                 return cache
 
-        translation = self.do_translate(text)
+        # 使用新的错误处理机制
+        translation = self.handle_translation_errors(text)
         self.cache.set(text, translation)
         return translation
 
@@ -188,6 +190,137 @@ class BaseTranslator:
         Actual translate text, override this method
         :param text: text to translate
         :return: translated text
+        """
+        raise NotImplementedError
+
+    def handle_translation_errors(self, text: str, max_retries: int = 10):
+        """
+        通用错误处理方法，处理429和400错误
+        :param text: 要翻译的文本
+        :param max_retries: 最大重试次数
+        :return: 翻译结果
+        """
+        current_delay = 1.0  # 初始延迟1秒
+        current_text = text
+        
+        for attempt in range(max_retries):
+            try:
+                # 调用具体的翻译方法
+                return self._do_translate_impl(current_text)
+                
+            except Exception as e:
+                error_message = str(e)
+                
+                # 检查是否是429错误（请求限制）
+                if ('429' in error_message or 'limit_requests' in error_message or 
+                    'RateLimitError' in error_message or 'rate limit' in error_message.lower()):
+                    logger.warning(f"RateLimitError (429) on attempt {attempt + 1}/{max_retries}: {e}")
+                    if attempt < max_retries - 1:
+                        # 将延迟时间增加到上次的70%
+                        current_delay = max(current_delay * 1.7, 1.0)
+                        logger.info(f"Waiting {current_delay:.2f} seconds before retry...")
+                        time.sleep(current_delay)
+                        continue
+                    else:
+                        logger.error(f"Failed to translate after {max_retries} attempts due to rate limiting")
+                        raise e
+                
+                # 检查是否是400错误（内容检查失败）
+                elif ('400' in error_message and 
+                      ('data_inspection_failed' in error_message or 'inappropriate content' in error_message)):
+                    logger.warning(f"Data inspection failed (400) on attempt {attempt + 1}/{max_retries}: {e}")
+                    if attempt < max_retries - 1:
+                        # 将文本分段处理，而不是简单截断
+                        if len(current_text) > 50:  # 确保文本足够长才进行分段
+                            # 尝试在句子边界分割
+                            segments = self._split_text_at_sentence_boundary(current_text)
+                            if len(segments) > 1:
+                                # 如果有多个段落，先尝试翻译第一个段落
+                                first_segment = segments[0]
+                                remaining_text = ' '.join(segments[1:])
+                                logger.info(f"Split text into {len(segments)} segments. Trying first segment ({len(first_segment)} chars)...")
+                                
+                                try:
+                                    # 翻译第一个段落
+                                    first_translation = self._do_translate_impl(first_segment)
+                                    
+                                    # 递归翻译剩余部分
+                                    if remaining_text.strip():
+                                        remaining_translation = self.handle_translation_errors(remaining_text, max_retries - attempt)
+                                        return first_translation + " " + remaining_translation
+                                    else:
+                                        return first_translation
+                                except Exception as segment_error:
+                                    # 如果分段翻译也失败，继续减少文本长度
+                                    logger.warning(f"Segment translation failed, reducing text length: {segment_error}")
+                                    new_length = int(len(current_text) * 0.7)
+                                    current_text = current_text[:new_length]
+                                    logger.info(f"Reduced text length to {len(current_text)} characters and retrying...")
+                                    continue
+                            else:
+                                # 无法分段，减少文本长度
+                                new_length = int(len(current_text) * 0.7)
+                                current_text = current_text[:new_length]
+                                logger.info(f"Could not split text, reduced length to {len(current_text)} characters and retrying...")
+                                continue
+                        else:
+                            logger.error("Text too short to process further")
+                            raise e
+                    else:
+                        logger.error(f"Failed to translate after {max_retries} attempts due to content inspection")
+                        raise e
+                
+                # 其他400错误（如参数错误等）
+                elif '400' in error_message:
+                    logger.error(f"Bad request error (400) on attempt {attempt + 1}/{max_retries}: {e}")
+                    # 对于参数错误等，直接抛出，不进行重试
+                    raise e
+                
+                # 其他错误
+                else:
+                    logger.error(f"Translation error on attempt {attempt + 1}/{max_retries}: {e}")
+                    raise e
+        
+        # 如果所有重试都失败了
+        raise Exception(f"Failed to translate after {max_retries} attempts")
+
+    def _split_text_at_sentence_boundary(self, text: str) -> list[str]:
+        """
+        在句子边界分割文本
+        :param text: 要分割的文本
+        :return: 分割后的文本段落列表
+        """
+        # 常见的句子结束标记
+        sentence_endings = ['.', '!', '?', '。', '！', '？', '\n\n']
+        
+        # 尝试在句子边界分割
+        for ending in sentence_endings:
+            if ending in text:
+                # 找到最后一个句子结束标记的位置
+                last_ending_pos = text.rfind(ending)
+                if last_ending_pos > len(text) * 0.3:  # 确保分割点不在文本开头
+                    first_part = text[:last_ending_pos + len(ending)].strip()
+                    second_part = text[last_ending_pos + len(ending):].strip()
+                    
+                    if first_part and second_part:
+                        return [first_part, second_part]
+        
+        # 如果无法在句子边界分割，尝试在单词边界分割
+        words = text.split()
+        if len(words) > 10:
+            mid_point = len(words) // 2
+            first_part = ' '.join(words[:mid_point])
+            second_part = ' '.join(words[mid_point:])
+            return [first_part, second_part]
+        
+        # 如果都无法分割，返回原文本
+        return [text]
+
+    def _do_translate_impl(self, text: str) -> str:
+        """
+        具体的翻译实现，子类需要重写这个方法
+        :param text: 要翻译的文本
+        :return: 翻译结果
         """
         raise NotImplementedError
 
@@ -538,6 +671,13 @@ class OpenAITranslator(BaseTranslator):
         ),
     )
     def do_translate(self, text) -> str:
+        # 使用新的错误处理机制
+        return self.handle_translation_errors(text)
+
+    def _do_translate_impl(self, text: str) -> str:
+        """
+        具体的OpenAI翻译实现
+        """
         response = self.client.chat.completions.create(
             model=self.model,
             **self.options,
@@ -615,6 +755,13 @@ class AzureOpenAITranslator(BaseTranslator):
         self.add_cache_impact_parameters("prompt", self.prompt("", self.prompttext))
 
     def do_translate(self, text) -> str:
+        # 使用新的错误处理机制
+        return self.handle_translation_errors(text)
+
+    def _do_translate_impl(self, text: str) -> str:
+        """
+        具体的Azure OpenAI翻译实现
+        """
         response = self.client.chat.completions.create(
             model=self.model,
             **self.options,
@@ -1142,6 +1289,10 @@ class QwenMtTranslator(OpenAITranslator):
         return langdict[input_lang]
 
     def do_translate(self, text) -> str:
+        # 使用新的错误处理机制
+        return self.handle_translation_errors(text)
+
+    def _do_translate_impl(self, text: str) -> str:
         """
         Qwen-MT Model reqeust to send translation_options to the server.
         domains are options, but suggested. it must be in English.

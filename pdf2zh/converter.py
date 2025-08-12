@@ -1,6 +1,7 @@
 import concurrent.futures
 import logging
 import re
+import time
 import unicodedata
 from enum import Enum
 from string import Template
@@ -343,19 +344,130 @@ class TranslateConverter(PDFConverterEx):
         # B. 段落翻译
         log.debug("\n==========[SSTACK]==========\n")
 
-        @retry(wait=wait_fixed(1))
         def worker(s: str):  # 多线程翻译
             if not s.strip() or re.match(r"^\{v\d+\}$", s):  # 空白和公式不翻译
                 return s
-            try:
-                new = self.translator.translate(s)
-                return new
-            except BaseException as e:
-                if log.isEnabledFor(logging.DEBUG):
-                    log.exception(e)
-                else:
-                    log.exception(e, exc_info=False)
-                raise e
+            
+            # 自适应重试机制
+            max_retries = 10
+            current_delay = 1.0  # 初始延迟1秒
+            current_text = s
+            original_text = s
+            
+            for attempt in range(max_retries):
+                try:
+                    new = self.translator.translate(current_text)
+                    return new
+                except Exception as e:
+                    error_message = str(e)
+                    
+                    # 检查是否是429错误（请求限制）
+                    if '429' in error_message or 'limit_requests' in error_message or 'RateLimitError' in error_message:
+                        log.warning(f"RateLimitError (429) on attempt {attempt + 1}/{max_retries} for text: {current_text[:50]}...")
+                        if attempt < max_retries - 1:
+                            # 将延迟时间增加到上次的70%
+                            current_delay = max(current_delay * 1.7, 1.0)
+                            log.info(f"Waiting {current_delay:.2f} seconds before retry...")
+                            time.sleep(current_delay)
+                            continue
+                        else:
+                            log.error(f"Failed to translate after {max_retries} attempts due to rate limiting")
+                            raise e
+                    
+                    # 检查是否是400错误（内容检查失败）
+                    elif ('400' in error_message and 
+                          ('data_inspection_failed' in error_message or 'inappropriate content' in error_message)):
+                        log.warning(f"Data inspection failed (400) on attempt {attempt + 1}/{max_retries} for text: {current_text[:50]}...")
+                        if attempt < max_retries - 1:
+                            # 将文本分段处理，而不是简单截断
+                            if len(current_text) > 50:  # 确保文本足够长才进行分段
+                                # 尝试在句子边界分割
+                                segments = _split_text_at_sentence_boundary(current_text)
+                                if len(segments) > 1:
+                                    # 如果有多个段落，先尝试翻译第一个段落
+                                    first_segment = segments[0]
+                                    remaining_text = ' '.join(segments[1:])
+                                    log.info(f"Split text into {len(segments)} segments. Trying first segment ({len(first_segment)} chars)...")
+                                    
+                                    try:
+                                        # 翻译第一个段落
+                                        first_translation = self.translator.translate(first_segment)
+                                        
+                                        # 递归翻译剩余部分
+                                        if remaining_text.strip():
+                                            remaining_translation = worker(remaining_text)
+                                            return first_translation + " " + remaining_translation
+                                        else:
+                                            return first_translation
+                                    except Exception as segment_error:
+                                        # 如果分段翻译也失败，继续减少文本长度
+                                        log.warning(f"Segment translation failed, reducing text length: {segment_error}")
+                                        new_length = int(len(current_text) * 0.7)
+                                        current_text = current_text[:new_length]
+                                        log.info(f"Reduced text length to {len(current_text)} characters and retrying...")
+                                        continue
+                                else:
+                                    # 无法分段，减少文本长度
+                                    new_length = int(len(current_text) * 0.7)
+                                    current_text = current_text[:new_length]
+                                    log.info(f"Could not split text, reduced length to {len(current_text)} characters and retrying...")
+                                    continue
+                            else:
+                                log.error("Text too short to process further")
+                                raise e
+                        else:
+                            log.error(f"Failed to translate after {max_retries} attempts due to content inspection")
+                            raise e
+                    
+                    # 其他400错误（如参数错误等）
+                    elif '400' in error_message:
+                        log.error(f"Bad request error (400) on attempt {attempt + 1}/{max_retries}: {e}")
+                        # 对于参数错误等，直接抛出，不进行重试
+                        raise e
+                    
+                    # 其他错误
+                    else:
+                        if log.isEnabledFor(logging.DEBUG):
+                            log.exception(e)
+                        else:
+                            log.exception(e, exc_info=False)
+                        raise e
+            
+            # 如果所有重试都失败了
+            raise Exception(f"Failed to translate after {max_retries} attempts")
+
+        def _split_text_at_sentence_boundary(text: str) -> list[str]:
+            """
+            在句子边界分割文本
+            :param text: 要分割的文本
+            :return: 分割后的文本段落列表
+            """
+            # 常见的句子结束标记
+            sentence_endings = ['.', '!', '?', '。', '！', '？', '\n\n']
+            
+            # 尝试在句子边界分割
+            for ending in sentence_endings:
+                if ending in text:
+                    # 找到最后一个句子结束标记的位置
+                    last_ending_pos = text.rfind(ending)
+                    if last_ending_pos > len(text) * 0.3:  # 确保分割点不在文本开头
+                        first_part = text[:last_ending_pos + len(ending)].strip()
+                        second_part = text[last_ending_pos + len(ending):].strip()
+                        
+                        if first_part and second_part:
+                            return [first_part, second_part]
+            
+            # 如果无法在句子边界分割，尝试在单词边界分割
+            words = text.split()
+            if len(words) > 10:
+                mid_point = len(words) // 2
+                first_part = ' '.join(words[:mid_point])
+                second_part = ' '.join(words[mid_point:])
+                return [first_part, second_part]
+            
+            # 如果都无法分割，返回原文本
+            return [text]
+
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.thread
         ) as executor:
